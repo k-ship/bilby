@@ -14,6 +14,119 @@ import dill as pickle
 from ..utils import (
     logger, get_progress_bar, check_directory_exists_and_if_not_mkdir)
 from .base_sampler import MCMCSampler, SamplerError
+import emcee
+from emcee.state import State
+from emcee.moves.move import Move 
+
+from ...core.sampler.proposal import JumpProposal 
+
+class RotationMove(emcee.moves.RedBlueMove):
+        def __init__(self, sigma=2.0, **kwargs):
+            self.sigma = sigma
+            super(RotationMove, self).__init__(**kwargs)
+
+        def get_proposal(self, s, c, random):
+            c = np.concatenate(c, axis=0)
+            Ns, Nc = len(s), len(c)
+            ndim = s.shape[1]
+            q = np.empty((Ns, ndim), dtype=np.float64)
+            angle = random.uniform(0, 2*np.pi)
+            sin, cos = np.sin(angle), np.cos(angle)
+            rotation_matrix = np.array(((cos, -sin), (sin, cos)))
+            for i in range(Ns):
+                q[i] = np.matmul(rotation_matrix, s[i]) + 0.03*np.random.randn(1,2)
+            return q, np.zeros(Ns, dtype=np.float64)
+
+class CustomRing(emcee.moves.RedBlueMove):
+   
+    def __init__(self, a=2.0, keys=[], **kwargs):
+        self.a = a
+        self.keys = keys
+        super(CustomRing, self).__init__(**kwargs)
+
+    def get_proposal(self, s, c, random):        
+        c = np.concatenate(c, axis=0)
+        Ns, Nc = len(s), len(c)
+        ndim = s.shape[1]
+        zz = ((self.a - 1.0) * random.rand(Ns) + 1) ** 2.0 / self.a
+        factors = np.zeros(Ns, dtype=np.float64)
+        q = np.zeros((Ns, ndim), dtype=np.float64)
+        rint = random.randint(Nc, size=(Ns,))      
+        angle = random.uniform(0, 2*np.pi)
+        sin, cos = np.sin(angle), np.cos(angle)
+        rotation_matrix = np.array(((cos, -sin), (sin, cos)))
+        
+        if 'ra' in self.keys and 'dec' in self.keys:
+            for i in range(Ns):
+                vec= []               
+                for j in range(len(self.keys)):
+                                      
+                    if self.keys[j] == 'ra':
+                        vec.append(s[i][j])
+                        ra_ind = j   
+
+                    if self.keys[j] == 'dec':
+
+                        vec.append(s[i][j])
+                        dec_ind = j
+
+                        if len(vec) < 1:
+                            dec_pos = 0
+                            ra_pos = 1
+                        else:
+                            dec_pos = 1
+                            ra_pos = 0                           
+           
+            rotated_vec = np.matmul(rotation_matrix, vec) 
+            q[i][dec_ind] = rotated_vec[dec_pos] 
+            q[i][ra_ind] = rotated_vec[ra_pos]       
+             
+        
+            dist = []
+            for i in range(Nc):
+                scale_vec = [c[i][dec_ind]] + [c[i][ra_ind]]
+                dist.append(((vec[1] - scale_vec[1])**2 + (vec[0] - scale_vec[0]**2))**0.5)     
+                
+               
+            min_index = dist.index(min(dist))    
+
+            q = c[min_index] - (c[min_index] - s) * zz[:, None]   
+        else:
+            q = c[rint] - (c[rint] - s) * zz[:, None]    
+
+        return q, factors
+    
+
+class PolarisationPhaseJump(emcee.moves.RedBlueMove):
+    """
+    Correlated polarisation/phase jump proposal. Jumps between degenerate phi/psi regions.
+    """
+    
+    def __init__(self, a=2.0, keys=[], **kwargs):
+        self.a = a
+        self.keys = keys
+        super(PolarisationPhaseJump, self).__init__(**kwargs)
+
+    def get_proposal(self, s, c, random):
+        c = np.concatenate(c, axis=0)
+        Ns, Nc = len(s), len(c)
+        ndim = s.shape[1]
+        zz = ((self.a - 1.0) * random.rand(Ns) + 1) ** 2.0 / self.a
+        rint = random.randint(Nc, size=(Ns,))     
+        q = c[rint] - (c[rint] - s) * zz[:, None]
+        
+        factors = np.zeros(Ns, dtype=np.float64)
+        if 'phase' in self.keys:
+            for i in range(len(s)):
+                for j in range(len(self.keys)):
+                    if self.keys[j] == 'phase':                        
+                        q[i][j] = (s[i][j] + np.pi) % 2*np.pi                      
+                
+                    if self.keys[j] == 'psi':
+                        q[i][j] = (s[i][j] + np.pi/2) % 2*np.pi
+        return q, factors
+                    
+                
 
 
 class Emcee(MCMCSampler):
@@ -45,24 +158,20 @@ class Emcee(MCMCSampler):
 
 
     """
-
-    default_kwargs = dict(
-        nwalkers=500, a=2, args=[], kwargs={}, postargs=None, pool=None,
-        live_dangerously=False, runtime_sortingfn=None, lnprob0=None,
-        rstate0=None, blobs0=None, iterations=100, thin=1, storechain=True,
-        mh_proposal=None)
-
+       
     def __init__(self, likelihood, priors, outdir='outdir', label='label',
                  use_ratio=False, plot=False, skip_import_verification=False,
-                 pos0=None, nburn=None, burn_in_fraction=0.25, resume=True,
-                 burn_in_act=3, **kwargs):
+                 pos0=None, nburn=None, search_parameters=[], burn_in_fraction=0.25, resume=True,
+                 burn_in_act=None, **kwargs):
         import emcee
         self.emcee = emcee
+  
 
         if LooseVersion(emcee.__version__) > LooseVersion('2.2.1'):
             self.prerelease = True
         else:
             self.prerelease = False
+
         super(Emcee, self).__init__(
             likelihood=likelihood, priors=priors, outdir=outdir,
             label=label, use_ratio=use_ratio, plot=plot,
@@ -72,11 +181,24 @@ class Emcee(MCMCSampler):
         self.pos0 = pos0
         self.nburn = nburn
         self.burn_in_fraction = burn_in_fraction
-        self.burn_in_act = burn_in_act
+        self.burn_in_act = burn_in_act             
+        
 
+       
+                    
         signal.signal(signal.SIGTERM, self.checkpoint_and_exit)
         signal.signal(signal.SIGINT, self.checkpoint_and_exit)
-
+       
+    @property  
+    def default_kwargs(self):
+        default_kwargs = dict(
+        nwalkers=500, a=2, moves = [(emcee.moves.GaussianMove())], args=[], kwargs={}, 
+        postargs=None, pool=None,
+        live_dangerously=False, runtime_sortingfn=None, lnprob0=None,
+        rstate0=None, blobs0=None, iterations=10000, thin=1, storechain=True,
+        mh_proposal=None)
+        return default_kwargs
+    
     def _check_version(self):
         import emcee
         if LooseVersion(emcee.__version__) > LooseVersion('2.2.1'):
@@ -101,6 +223,7 @@ class Emcee(MCMCSampler):
                                "of an appropriate Pool object passed to the "
                                "'pool' keyword.")
                 kwargs['threads'] = 1
+
 
     @property
     def sampler_function_kwargs(self):
@@ -162,6 +285,45 @@ class Emcee(MCMCSampler):
         else:
             log_likelihood = self.log_likelihood(theta)
             return log_likelihood + log_prior, [log_likelihood, log_prior]
+
+    def MH_ring_proposal(random, s):        
+        Ns = len(s)   
+        factors = np.zeros(Ns, dtype=np.float64)
+        q = np.zeros((Ns, ndim), dtype=np.float64)         
+        angle = random.uniform(0, 2*np.pi)
+        sin, cos = np.sin(angle), np.cos(angle)
+        rotation_matrix = np.array(((cos, -sin), (sin, cos)))
+        
+        if 'ra' in self.keys and 'dec' in self.keys:
+            for i in range(Ns):
+                vec= []               
+                for j in range(len(self.keys)):
+                                      
+                    if self.keys[j] == 'ra':
+                        vec.append(s[i][j])
+                        ra_ind = j   
+
+                    if self.keys[j] == 'dec':
+
+                        vec.append(s[i][j])
+                        dec_ind = j
+
+                        if len(vec) < 1:
+                            dec_pos = 0
+                            ra_pos = 1
+                        else:
+                            dec_pos = 1
+                            ra_pos = 0                           
+           
+            rotated_vec = np.matmul(rotation_matrix, vec) 
+            q[i][dec_ind] = rotated_vec[dec_pos] 
+            q[i][ra_ind] = rotated_vec[ra_pos] 
+                    
+
+            return q, factors
+
+
+
 
     @property
     def nburn(self):
@@ -348,6 +510,7 @@ class Emcee(MCMCSampler):
             logger.debug("Generating initial walker positions from prior")
             self.pos0 = self._draw_pos0_from_prior()
 
+    
     def _set_pos0_for_resume(self):
         self.pos0 = self.sampler.chain[:, -1, :]
 
@@ -362,13 +525,14 @@ class Emcee(MCMCSampler):
         else:
             sampler_function_kwargs['p0'] = self.pos0
 
+    
         # main iteration loop
         for sample in tqdm(
                 self.sampler.sample(iterations=iterations, **sampler_function_kwargs),
                 total=iterations):
             self.write_chains_to_file(sample)
         self.checkpoint()
-
+        
         self.result.sampler_output = np.nan
         self.calculate_autocorrelation(
             self.sampler.chain.reshape((-1, self.ndim)))
@@ -388,5 +552,11 @@ class Emcee(MCMCSampler):
         self.result.log_prior_evaluations = log_priors
         self.result.walkers = self.sampler.chain
         self.result.log_evidence = np.nan
-        self.result.log_evidence_err = np.nan
+        self.result.log_evidence_err = np.nan           
+        self.result.acceptance_fraction = self.sampler.acceptance_fraction     
+        # self.result.autocorr_time = self.sampler.get_autocorr_time()
         return self.result
+    
+    
+    
+   

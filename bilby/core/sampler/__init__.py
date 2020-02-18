@@ -48,7 +48,7 @@ def run_sampler(likelihood, priors=None, label='label', outdir='outdir',
                 sampler='dynesty', use_ratio=None, injection_parameters=None,
                 conversion_function=None, plot=False, default_priors_file=None,
                 clean=None, meta_data=None, save=True, gzip=False,
-                result_class=None, **kwargs):
+                result_class=None, search_parameters=None, **kwargs):
     """
     The primary interface to easy parameter estimation
 
